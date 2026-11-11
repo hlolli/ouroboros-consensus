@@ -46,12 +46,13 @@ import Ouroboros.Consensus.MiniProtocol.ChainSync.Client.InFutureCheck
   , SomeHeaderInFutureCheck
   )
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
-  ( OfferedHalves (..)
-  , PeerOffer (..)
+  ( PeerOffer (..)
+  , WhetherTxsClosureOffered (..)
   )
 import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client
 import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client.Announcements.Validation
   ( AnnouncingHeader (ancHeader)
+  , LeiosAnnouncementAgeLimits
   , ValidAnnouncement
   )
 import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client.State
@@ -92,6 +93,7 @@ leiosNotifyClient ::
   SystemTime m ->
   SomeHeaderInFutureCheck m blk ->
   ClockSkew ->
+  LeiosAnnouncementAgeLimits ->
   -- | what to do with an announcement new to the node
   (ValidAnnouncement blk -> m ()) ->
   -- | record an offer the peer made
@@ -109,6 +111,7 @@ leiosNotifyClient
   systemTime
   chainSyncFutureCheck
   maxClockSkew
+  ageLimits
   onNewAnnouncement
   recordOffer
   controlMessageSTM
@@ -129,6 +132,7 @@ leiosNotifyClient
               either throwIO pure
                 =<< runExceptT
                   ( onLeiosNotifyAnnouncement
+                      ageLimits
                       systemTime
                       chainSyncFutureCheck
                       cfg
@@ -147,15 +151,15 @@ leiosNotifyClient
             atomically $ do
               immLedger <- ChainDB.getImmutableLedger chainDB
               checkAndUpdate_ $ checkLeiosBlockOffer cfg immLedger point claimed
-            recordOffer point $ MkPeerOffer SNothing (OfferedBody claimed)
+            recordOffer point $ MkPeerOffer SNothing (SJust claimed) TxsClosureNotOffered
           MsgLeiosBlockTxsOffer point -> do
             atomically $ checkAndUpdate_ $ checkLeiosClosureOffer point
-            recordOffer point $ MkPeerOffer SNothing OfferedClosure
+            recordOffer point $ MkPeerOffer SNothing SNothing TxsClosureOffered
           MsgLeiosVotes votes -> do
             now <- systemTimeCurrent systemTime
             accepted <- atomically $ do
               immLedger <- ChainDB.getImmutableLedger chainDB
-              checkAndUpdate $ checkLeiosVotes cfg maxClockSkew immLedger now votes
+              checkAndUpdate $ checkLeiosVotes cfg ageLimits maxClockSkew immLedger now votes
             for_ accepted $ \vote@MkAcceptedVote{acceptedVote} ->
               addVote voteState systemTime vote >>= \case
                 Added ->

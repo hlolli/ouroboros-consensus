@@ -14,11 +14,9 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
 import qualified Data.Map.NonEmpty as NEMap
 import qualified Data.Map.Strict as Map
-import Data.Maybe.Strict (StrictMaybe (SNothing))
+import Data.Maybe.Strict (StrictMaybe (SJust, SNothing))
 import Data.Sequence.NonEmpty (NESeq)
 import qualified Data.Set as Set
-import qualified Data.Set.NonEmpty as NESet
-import Data.Word (Word64)
 import Ouroboros.Consensus.Forecast (OutsideForecastRange)
 import Ouroboros.Consensus.Leios.Types
   ( BytesSize
@@ -34,8 +32,8 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
   , LeiosFetchRequest (..)
   , LeiosFetchStaticEnv (..)
   , LeiosOutstanding (..)
-  , OfferedHalves (..)
   , PeerOffer (MkPeerOffer)
+  , WhetherTxsClosureOffered (..)
   , acquireEbBody
   , defaultLeiosFetchStaticEnv
   , emptyLeiosOutstanding
@@ -111,7 +109,7 @@ test_fetchPriorityOrder =
   map (unSlot . (.pointSlotNo)) (hi ++ lo)
     @?= [90, 95, 100, 101, 105, 89, 50, 0]
  where
-  (hi, lo) = fetchPriorityTiers (Just (SlotNo 100, 10)) offers
+  (hi, lo) = fetchPriorityTiers (Just (SlotNo 100)) 10 offers
   offers = [(SlotNo (fromIntegral a), point a 'x') | a <- [0, 105, 90, 50, 100, 89, 101, 95]]
   unSlot (SlotNo n) = n
 
@@ -172,12 +170,12 @@ test_bodyAskedOnceOfBothOfferer = do
   requestedOffsets reqs3 @?= IntSet.singleton 0
  where
   p = point 1 'a'
-  offers0 = Map.singleton p (MkPeerOffer SNothing (OfferedBodyAndClosure 1024))
+  offers0 = Map.singleton p (MkPeerOffer SNothing (SJust 1024) TxsClosureOffered)
   decide outstanding offers =
     leiosFetchLogicIteration
       env
       anyBounds
-      (Just (minBound, priorityWindow))
+      (Just minBound)
       (Map.singleton peerA offers)
       Map.empty
       outstanding
@@ -209,13 +207,13 @@ test_closureOfferedMeanwhile = do
       (maxJobBytesSize env)
       (maxJobTxCount env)
       (IntMap.singleton 0 (txHashOf 0, 100))
-  bodyOffered = Map.singleton p (MkPeerOffer SNothing (OfferedBody 1024))
-  closureOffered = MkPeerOffer SNothing OfferedClosure
+  bodyOffered = Map.singleton p (MkPeerOffer SNothing (SJust 1024) TxsClosureNotOffered)
+  closureOffered = MkPeerOffer SNothing SNothing TxsClosureOffered
   decide outstanding offers =
     leiosFetchLogicIteration
       env
       anyBounds
-      (Just (minBound, priorityWindow))
+      (Just minBound)
       (Map.singleton peerA offers)
       Map.empty
       outstanding
@@ -237,12 +235,12 @@ test_forgedNotFetched = do
   pruneOffers (maybe Map.empty NEMap.toMap (Map.lookup peerA prunes)) offers @?= Map.empty
  where
   p = point 1 'a'
-  offers = Map.singleton p (MkPeerOffer SNothing (OfferedBodyAndClosure 1024))
+  offers = Map.singleton p (MkPeerOffer SNothing (SJust 1024) TxsClosureOffered)
   (_, reqs, prunes) =
     leiosFetchLogicIteration
       env
       anyBounds
-      (Just (minBound, priorityWindow))
+      (Just minBound)
       (Map.singleton peerA offers)
       Map.empty
       (markReceivingFromForge p (scOutstanding (empty & withMissingBody p 1024)))
@@ -296,7 +294,7 @@ test_bigLedgerPeerBudget = do
   jobPool = Jobs.mkLeiosJobPool (maxJobBytesSize env) (maxJobTxCount env) misses
   -- The body is already held in these runs, so the offer names no size; only
   -- its closure half is consulted.
-  offers = Map.singleton peerA $ Map.singleton p (MkPeerOffer SNothing OfferedClosure)
+  offers = Map.singleton peerA $ Map.singleton p (MkPeerOffer SNothing SNothing TxsClosureOffered)
   ordinaryCap = maxRequestedBytesSizePerPeer env
   bigLedgerCap = maxRequestedBytesSizePerBigLedgerPeer env
   -- hold the body (so the pool is live), with the peer's in-flight bytes
@@ -313,7 +311,7 @@ test_bigLedgerPeerBudget = do
           leiosFetchLogicIteration
             env
             anyBounds
-            (Just (SlotNo 11, priorityWindow))
+            (Just (SlotNo 11))
             offers
             bigLedgerPeers
             outstanding
@@ -358,8 +356,7 @@ test_pickJobs = do
 
 -- | A test fixture: peer offerings, outstanding work.
 data Scenario = Scenario
-  { scOfferings :: !(Map.Map Peer (Set.Set LeiosPoint))
-  -- ^ The points each peer offers the body of.
+  { scOfferings :: !(Map.Map Peer (Map.Map LeiosPoint WhetherTxsClosureOffered))
   , scOfferedSizes :: !(Map.Map LeiosPoint BytesSize)
   -- ^ The size each point is offered at.
   --
@@ -414,11 +411,6 @@ alreadyRequestedEbFrom p peers =
     o
       { requestedEbPeers =
           Map.insertWith Set.union p (Set.fromList peers) (requestedEbPeers o)
-      , requestedEbsPerPeer =
-          foldr
-            (\peer -> Map.insertWith NESet.union peer (NESet.singleton p))
-            (requestedEbsPerPeer o)
-            peers
       }
 
 -- | Set a per-peer in-flight byte total. Use with the env's per-peer
@@ -434,9 +426,9 @@ offersBody peer points sc =
   sc
     { scOfferings =
         Map.insertWith
-          Set.union
+          Map.union
           peer
-          (Set.fromList points)
+          (Map.fromList [(p, TxsClosureNotOffered) | p <- points])
           (scOfferings sc)
     }
 
@@ -474,23 +466,19 @@ runIterationWithAt forecastEbBounds currentSlot sc =
         leiosFetchLogicIteration
           env
           forecastEbBounds
-          (Just (currentSlot, priorityWindow))
-          (Map.map (Map.fromSet (resolveOfferSize sc.scOfferedSizes)) sc.scOfferings)
+          (Just currentSlot)
+          (Map.map (Map.mapWithKey (resolveOfferSize sc.scOfferedSizes)) sc.scOfferings)
           Map.empty
           sc.scOutstanding
    in reqs
 
--- | Give a fixture's body offer the size 'withMissingBody' said peers offer that
+-- | Give a fixture's offer the size 'withMissingBody' said peers offer that
 -- point at, which is the size the decision logic then requests. A point no
--- 'withMissingBody' named is offered at size 0, which matters to no scenario:
--- no election fetches it.
-resolveOfferSize :: Map.Map LeiosPoint BytesSize -> LeiosPoint -> PeerOffer
-resolveOfferSize sizes p = MkPeerOffer SNothing (OfferedBody (Map.findWithDefault 0 p sizes))
-
--- | How many slots before the current one a point is still worth voting on, in
--- these tests.
-priorityWindow :: Word64
-priorityWindow = 10
+-- 'withMissingBody' named is offered with no size, which is the closure-only
+-- case.
+resolveOfferSize ::
+  Map.Map LeiosPoint BytesSize -> LeiosPoint -> WhetherTxsClosureOffered -> PeerOffer
+resolveOfferSize sizes p = MkPeerOffer SNothing (maybe SNothing SJust (Map.lookup p sizes))
 
 {-------------------------------------------------------------------------------
   Assertions

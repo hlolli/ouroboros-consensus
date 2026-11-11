@@ -32,8 +32,8 @@ module Test.Consensus.Leios.NodeUnderTest
   , nodeVersionData
   , defaultNodeUnderTestConfig
   , maxEbBodySize
+  , withJumpingNode
   , withNode
-  , withNodeAgeLimits
   , withNodeCommittee
   , withNodeForecastingOnly
   , withNodeOver
@@ -65,12 +65,12 @@ import Control.ResourceRegistry (ResourceRegistry, withRegistry)
 import Control.Tracer (nullTracer)
 import Data.ByteString.Lazy (ByteString)
 import Data.Hashable (Hashable)
-import Data.Maybe.Strict (StrictMaybe (SJust))
+import Data.Maybe.Strict (StrictMaybe (SJust, SNothing))
 import Data.Proxy (Proxy (..))
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Network.Mux as Mux
-import Ouroboros.Consensus.Block (SlotNo, WithOrigin (..), blockSlot)
+import Ouroboros.Consensus.Block (SlotNo, WithOrigin (..), blockSlot, getHeader)
 import Ouroboros.Consensus.BlockchainTime
   ( BackoffDelay (..)
   , BlockchainTime
@@ -84,20 +84,22 @@ import Ouroboros.Consensus.Config
   ( DiffusionPipeliningSupport (..)
   , SecurityParam (..)
   , TopLevelConfig
+  , configBlock
   , configLedger
   )
 import Ouroboros.Consensus.Config.SupportsNode (getNetworkMagic, getSystemStart)
 import qualified Ouroboros.Consensus.HardFork.History as HardFork
+import Ouroboros.Consensus.HeaderValidation (certifiedLeiosAnnouncement)
 import Ouroboros.Consensus.Ledger.Extended (ledgerState)
 import Ouroboros.Consensus.Leios.Acquisitions (LeiosAcquisitions, newLeiosAcquisitions)
 import Ouroboros.Consensus.Leios.Protocol (LeiosLedgerView (..))
 import Ouroboros.Consensus.Leios.Types (BytesSize)
+import Ouroboros.Consensus.MiniProtocol.ChainSync.Client
+  ( CSJConfig (..)
+  , CSJEnabledConfig (..)
+  )
 import qualified Ouroboros.Consensus.MiniProtocol.ChainSync.Client.HistoricityCheck as HistoricityCheck
 import qualified Ouroboros.Consensus.MiniProtocol.ChainSync.Client.InFutureCheck as InFutureCheck
-import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client.Announcements.Validation
-  ( LeiosAnnouncementAgeLimits
-  , defaultLeiosAnnouncementAgeLimits
-  )
 import qualified Ouroboros.Consensus.Network.NodeToNode as NTN
 import Ouroboros.Consensus.Node
   ( mkNodeKernelArgs
@@ -110,7 +112,8 @@ import Ouroboros.Consensus.Node
 import Ouroboros.Consensus.Node.ExitPolicy (NodeToNodeInitiatorResult)
 import qualified Ouroboros.Consensus.Node.GSM as GSM
 import Ouroboros.Consensus.Node.Genesis
-  ( disableGenesisConfig
+  ( GenesisConfig (..)
+  , disableGenesisConfig
   , mkGenesisNodeKernelArgs
   )
 import Ouroboros.Consensus.Node.NetworkProtocolVersion
@@ -160,7 +163,7 @@ data NodeUnderTestConfig = NodeUnderTestConfig
   , nodeConfigLedger :: LeiosTestLedgerConfig
   , nodeConfigRandomness :: StdGen
   -- ^ The root of all the test's randomness; see 'Seeds'.
-  , nodeConfigAnnouncementAgeLimits :: LeiosAnnouncementAgeLimits
+  , nodeConfigCsj :: CSJConfig
   }
 
 defaultNodeUnderTestConfig :: SecurityParam -> LeiosTestLedgerConfig -> NodeUnderTestConfig
@@ -169,7 +172,7 @@ defaultNodeUnderTestConfig nodeConfigSecurityParam nodeConfigLedger =
     { nodeConfigSecurityParam
     , nodeConfigLedger
     , nodeConfigRandomness = mkStdGen 0
-    , nodeConfigAnnouncementAgeLimits = defaultLeiosAnnouncementAgeLimits
+    , nodeConfigCsj = CSJDisabled
     }
 
 -- | All the randomness of a Leios node-vs-environment test.
@@ -209,7 +212,7 @@ data NodeUnderTest m = NodeUnderTest
   , nodeVersions :: NodeVersions m
   , nodeSeeds :: Seeds StdGen
   , nodeLeiosAcquisitions :: LeiosAcquisitions m
-  -- ^ Where a test emits the endorser blocks and closures the node
+  -- ^ Where a test announces the endorser blocks and closures the node
   -- acquires, as the node's LeiosFetch would.
   , nodeConnectedPeers :: StrictTVar m (Set PeerAddr)
   -- ^ The peers the node has a connection to.
@@ -219,21 +222,32 @@ data NodeUnderTest m = NodeUnderTest
 addBlocks :: IOLike m => NodeUnderTest m -> [Blk] -> m ()
 addBlocks node = addBlocksAfter node Origin
 
--- | Add a chain to the node's ChainDB, oldest first, given the slot of its
--- first block's predecessor
+-- | Add a chain to the node's ChainDB, oldest first, given its first block's
+-- predecessor
 --
 -- A 'LeiosTestBlock''s ledger view is the same at every slot.
-addBlocksAfter :: IOLike m => NodeUnderTest m -> WithOrigin SlotNo -> [Blk] -> m ()
-addBlocksAfter node predecessorSlot blks =
+addBlocksAfter :: IOLike m => NodeUnderTest m -> WithOrigin Blk -> [Blk] -> m ()
+addBlocksAfter node predecessor blks =
   sequence_ $
     zipWith
-      ( \predSlot ->
-          ChainDB.addBlock_ (nodeChainDB node) noPunishment predSlot leiosView
+      ( \prev blk ->
+          ChainDB.addBlock_
+            (nodeChainDB node)
+            noPunishment
+            (blockSlot <$> prev)
+            leiosView
+            (certified prev blk)
+            blk
       )
-      (predecessorSlot : map (NotOrigin . blockSlot) blks)
+      (predecessor : map NotOrigin blks)
       blks
  where
-  leiosView = SJust (ltlcLeios (configLedger (nodeTopLevelConfig node)))
+  cfg = nodeTopLevelConfig node
+  leiosView = SJust (ltlcLeios (configLedger cfg))
+  certified prev blk = case prev of
+    Origin -> SNothing
+    NotOrigin p ->
+      certifiedLeiosAnnouncement (configBlock cfg) (getHeader blk) (latestAnnouncement (getHeader p))
 
 -- | The node's node-to-node applications, at every mini-protocol's bytes.
 type NodeApps m =
@@ -281,8 +295,10 @@ withNodeUnderTest ::
   (NodeUnderTest (IOSim s) -> IOSim s a) ->
   IOSim s a
 withNodeUnderTest cfg tracers nodeDBs leiosDB body = do
-  -- What a node with Genesis disabled, the default, runs with.
-  (genesisArgs, updateChainDbArgs) <- mkGenesisNodeKernelArgs disableGenesisConfig
+  -- What a node with Genesis disabled, the default, runs with, but for
+  -- ChainSync jumping, which the test chooses.
+  let genesisConfig = disableGenesisConfig{gcCSJConfig = nodeConfigCsj cfg}
+  (genesisArgs, updateChainDbArgs) <- mkGenesisNodeKernelArgs genesisConfig
   let seeds = configSeeds cfg
   leiosAcquisitions <- newLeiosAcquisitions
   -- The ChainDB and the node each get their own resource registry. The node's
@@ -311,7 +327,6 @@ withNodeUnderTest cfg tracers nodeDBs leiosDB body = do
         publicPeerSelectionStateVar <- makePublicPeerSelectionStateVar
         kernelArgs <-
           nodeKernelArgsEnforceInvariants
-            . (\args -> args{leiosAnnouncementAgeLimits = nodeConfigAnnouncementAgeLimits cfg})
             <$> mkNodeKernelArgs
               kernelRegistry
               (mkUnsafeSalt (fst (random (seedBlockFetchSalt seeds))))
@@ -331,15 +346,22 @@ withNodeUnderTest cfg tracers nodeDBs leiosDB body = do
               -- How long the node stays caught up at least, which does not
               -- matter, since it never leaves.
               0
-              -- The node starts caught up, as one that was caught up when it
-              -- last shut down does, and never judges its selection too old, so
-              -- it stays caught up however far the simulated clock runs ahead of
-              -- the test's chain.
+              -- Without ChainSync jumping, the node starts caught up, as one
+              -- that was caught up when it last shut down does, and never judges
+              -- its selection too old, so it stays caught up however far the
+              -- simulated clock runs ahead of the test's chain.
+              --
+              -- ChainSync jumping ignores a peer that connects while the node is
+              -- caught up, so with it, the node instead starts syncing. It stays
+              -- so, since nothing tells it that it has the peers it needs to
+              -- leave.
               Nothing
               GSM.MarkerFileView
                 { GSM.touchMarkerFile = pure ()
                 , GSM.removeMarkerFile = pure ()
-                , GSM.hasMarkerFile = pure True
+                , GSM.hasMarkerFile = pure $ case nodeConfigCsj cfg of
+                    CSJDisabled -> True
+                    CSJEnabled{} -> False
                 }
               (pure DontUseBootstrapPeers)
               publicPeerSelectionStateVar
@@ -354,7 +376,7 @@ withNodeUnderTest cfg tracers nodeDBs leiosDB body = do
                 (seedNodeToNodeApps seeds)
                 NTN.nullTracers
                 defaultChainSyncIdleTimeout
-                disableGenesisConfig
+                genesisConfig
                 defaultTxSubmissionLogicVersion
                 kernelArgs
                 kernel
@@ -384,6 +406,20 @@ withNodeUnderTest cfg tracers nodeDBs leiosDB body = do
 withNode :: (NodeUnderTest (IOSim s) -> IOSim s a) -> IOSim s a
 withNode = withNodeForecastingOnly 100000
 
+-- | 'withNode', with ChainSync jumping, of this many slots at a time.
+withJumpingNode :: SlotNo -> (NodeUnderTest (IOSim s) -> IOSim s a) -> IOSim s a
+withJumpingNode jumpSize body = do
+  nodeDBs <- emptyNodeDBs
+  leiosDB <- newLeiosDBInMemory
+  withNodeUnderTest
+    (forecastingOnly testCommittee testQuorumStakeThreshold 100000)
+      { nodeConfigCsj = CSJEnabled CSJEnabledConfig{csjcJumpSize = jumpSize}
+      }
+    nullTracers
+    nodeDBs
+    leiosDB
+    body
+
 -- | A node whose ledger view forecasts this many slots past its immutable tip.
 withNodeForecastingOnly :: SlotNo -> (NodeUnderTest (IOSim s) -> IOSim s a) -> IOSim s a
 withNodeForecastingOnly range body = do
@@ -391,21 +427,6 @@ withNodeForecastingOnly range body = do
   leiosDB <- newLeiosDBInMemory
   withNodeUnderTest
     (forecastingOnly testCommittee testQuorumStakeThreshold range)
-    nullTracers
-    nodeDBs
-    leiosDB
-    body
-
--- | 'withNode', but with these announcement age limits.
-withNodeAgeLimits ::
-  LeiosAnnouncementAgeLimits -> (NodeUnderTest (IOSim s) -> IOSim s a) -> IOSim s a
-withNodeAgeLimits limits body = do
-  nodeDBs <- emptyNodeDBs
-  leiosDB <- newLeiosDBInMemory
-  withNodeUnderTest
-    (forecastingOnly testCommittee testQuorumStakeThreshold 100000)
-      { nodeConfigAnnouncementAgeLimits = limits
-      }
     nullTracers
     nodeDBs
     leiosDB

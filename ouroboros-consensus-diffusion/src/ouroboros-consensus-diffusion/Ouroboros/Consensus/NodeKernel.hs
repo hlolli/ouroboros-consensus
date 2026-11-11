@@ -75,6 +75,7 @@ import Ouroboros.Consensus.Leios.NotifyLog
   , notifyLogPruner
   )
 import Ouroboros.Consensus.Leios.Protocol (LeiosLedgerView)
+import Ouroboros.Consensus.Leios.TxCache (defaultLeiosTxCacheShift, newHashTableLeiosTxCache)
 import Ouroboros.Consensus.Leios.Types (ForgedEndorserBlock)
 import Ouroboros.Consensus.Leios.VoteState (VoteState, newVoteState, votePruner)
 import Ouroboros.Consensus.Mempool
@@ -97,6 +98,7 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision (defaultLeiosFetchSt
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Kernel
   ( LeiosFetchKernel
   , leiosFetchDecisionLoop
+  , leiosFetchFocuser
   , leiosFetchPruner
   , newLeiosFetchKernel
   , onForgedLeiosEb
@@ -104,7 +106,7 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Kernel
 import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client.Announcements.Validation
   ( LeiosAnnouncementAgeLimits
   , ValidAnnouncement (..)
-  , validHeaderAnnouncement
+  , chainSyncAnnouncement
   )
 import Ouroboros.Consensus.MiniProtocol.LeiosNotify.Client.State
   ( LeiosNotifyPeerState
@@ -182,7 +184,7 @@ import Ouroboros.Network.TxSubmission.Mempool.Reader
   ( TxSubmissionMempoolReader
   )
 import qualified Ouroboros.Network.TxSubmission.Mempool.Reader as MempoolReader
-import System.Random (StdGen)
+import System.Random (StdGen, splitGen, uniform)
 
 {-------------------------------------------------------------------------------
   Relay node
@@ -251,6 +253,8 @@ data NodeKernel m addrNTN addrNTC blk = NodeKernel
   -- ^ What the node relays to its downstream peers over LeiosNotify.
   , getLeiosFetchKernel :: LeiosFetchKernel m (ConnectionId addrNTN) blk
   -- ^ What the node's LeiosFetch clients share.
+  , getLeiosAnnouncementAgeLimits :: LeiosAnnouncementAgeLimits
+  -- ^ How old an announcement the node relays or accepts.
   }
 
 -- | Arguments required when initializing a node
@@ -265,9 +269,9 @@ data NodeKernelArgs m addrNTN addrNTC blk = NodeKernelArgs
   , leiosDB :: LeiosDbHandle m
   -- ^ Whoever opened it closes it, once the node kernel's threads have stopped.
   , leiosAcquisitions :: LeiosAcquisitions m
-  -- ^ Where the node's LeiosFetch emits what it acquires.
+  -- ^ Where the node's LeiosFetch announces what it acquires.
   , leiosFetchRng :: StdGen
-  -- ^ Seeds the LeiosFetch decision loop's PRNG.
+  -- ^ Seeds the LeiosFetch decision loop's PRNG and the LeiosTxCache's salt.
   , leiosAnnouncementAgeLimits :: LeiosAnnouncementAgeLimits
   -- ^ How old an announcement the node relays or accepts.
   , initChainDB :: StorageConfig blk -> InitChainDB m blk -> m ()
@@ -458,15 +462,22 @@ initNodeKernel
       forkLinkedThread registry "NodeKernel.notifyLogPruner" $
         notifyLogPruner systemTime leiosNotifyLog
 
+    -- The LeiosTxCache's keys are chosen by peers, so its hash table is salted
+    -- with a secret of this node's.
+    let (leiosFetchPrng, saltRng) = splitGen leiosFetchRng
+        (salt0, saltRng') = uniform saltRng
+        (salt1, _) = uniform saltRng'
+    leiosTxCache <- newHashTableLeiosTxCache defaultLeiosTxCacheShift salt0 salt1
     leiosWriter <- allocateWriter registry leiosDB
     leiosFetchKernel <-
-      newLeiosFetchKernel chainDB leiosDB leiosFetchRng $ \outstanding ready ->
+      newLeiosFetchKernel chainDB leiosDB leiosFetchPrng $ \outstanding ready ->
         MkLeiosFetchClientContext
           { lfcStaticEnv = defaultLeiosFetchStaticEnv (fromIntegral maxLeiosFetchIngressBytes)
           , lfcOutstanding = outstanding
           , lfcReady = ready
+          , lfcTxCache = leiosTxCache
           , lfcWriter = leiosWriter
-          , lfcNotify = emitLeiosAcquisition leiosAcquisitions
+          , lfcNotify = announceLeiosAcquisition leiosAcquisitions
           , lfcSystemTime = systemTime
           , lfcTracer = leiosFetchClientTracer tracers
           }
@@ -477,6 +488,9 @@ initNodeKernel
       forkLinkedThread registry "NodeKernel.leiosFetchPruner" $
         leiosFetchPruner chainDB leiosFetchKernel
     void $
+      forkLinkedThread registry "NodeKernel.leiosFetchFocuser" $
+        leiosFetchFocuser chainDB leiosFetchKernel
+    void $
       forkLinkedThread registry "NodeKernel.leiosOfferRelay" $
         leiosOfferRelay leiosAcquisitions leiosNotifyLog
 
@@ -485,7 +499,7 @@ initNodeKernel
     -- a peer go through, with no peer. As for a header ChainSync validated, the
     -- announcement needs no further check: the forge built the header.
     let onForgedEb hdr onset leiosView forged = do
-          mbValid <- validHeaderAnnouncement systemTime cfg hdr onset leiosView
+          mbValid <- chainSyncAnnouncement systemTime cfg hdr onset leiosView
           -- A forged header announces the endorser block forged with it.
           for_ mbValid $ \valid -> do
             void $ atomically $ onValidAnnouncement leiosAnnounceState valid
@@ -532,6 +546,7 @@ initNodeKernel
         , getLeiosVoteState = leiosVoteState
         , getLeiosNotifyLog = leiosNotifyLog
         , getLeiosFetchKernel = leiosFetchKernel
+        , getLeiosAnnouncementAgeLimits = leiosAnnouncementAgeLimits
         }
    where
     blockForgingController ::

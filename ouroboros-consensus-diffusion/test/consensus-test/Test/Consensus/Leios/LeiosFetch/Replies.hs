@@ -15,18 +15,20 @@ import Control.Concurrent.Class.MonadSTM.Strict
   , check
   , modifyTVar
   , newEmptyTMVarIO
+  , newTQueueIO
   , newTVarIO
   , putTMVar
   , readTMVar
+  , readTQueue
   , readTVar
   , readTVarIO
+  , writeTQueue
   )
 import Control.Exception (SomeException, try)
 import Control.Tracer (nullTracer)
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Short as SBS
 import Data.Foldable (toList)
-import qualified Data.IntMap.NonEmpty as NEIntMap
 import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Map.Strict as Map
@@ -37,11 +39,19 @@ import Ouroboros.Consensus.BlockchainTime.WallClock.Types
   , SystemTime (..)
   )
 import Ouroboros.Consensus.Leios.Acquisitions (LeiosEbNotification (..))
+import Ouroboros.Consensus.Leios.TxCache
+  ( LeiosTxCache (..)
+  , defaultLeiosTxCacheShift
+  , newPureLeiosTxCache
+  )
+import Ouroboros.Consensus.Leios.TxCache.API (packEndorserBlock)
 import Ouroboros.Consensus.Leios.Types
   ( ElectionId (..)
   , EndorserBlock
   , LeiosPoint (..)
   , LeiosTx (..)
+  , ProtVerParity (..)
+  , RankingBlockHash (..)
   , encodeEndorserBlockSize
   , endorserBlockFromTxBytes
   , endorserBlockHash
@@ -60,11 +70,11 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
   ( EbFetchState (..)
   , EbState (..)
   , LeiosBlockRequest (..)
-  , LeiosBlockTxsRequest (..)
+  , LeiosBlockTxsRequest
   , LeiosFetchRequest (..)
   , LeiosOutstanding (..)
-  , OfferedHalves (..)
   , PeerOffer (..)
+  , WhetherTxsClosureOffered (..)
   , defaultLeiosFetchStaticEnv
   , emptyLeiosOutstanding
   , focusElectionIfUnfocused
@@ -73,7 +83,6 @@ import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
   , pruneOutstandingToImmTip
   , recordReferencedPoint
   )
-import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Jobs (nullLeiosJobPool)
 import Ouroboros.Consensus.Storage.LeiosDB
   ( LeiosDbHandle (..)
   , newLeiosDBInMemory
@@ -87,7 +96,7 @@ import Ouroboros.Consensus.Util.NormalForm.StrictMVar (uncheckedNewEmptyMVar, un
 import System.Random (mkStdGen)
 import qualified System.Timeout as Timeout
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
+import Test.Tasty.HUnit (Assertion, assertFailure, testCase, (@?=))
 
 tests :: TestTree
 tests =
@@ -104,8 +113,11 @@ tests =
         "the client acquires nothing for a body whose point was pruned while it was being written, and fetches the endorser block again at a newer point"
         test_prunedWhileWriting
     , testCase
-        "the client acquires no closure whose transactions are not the sizes its endorser block declares, fetches no more of it, and disconnects the peer that served them"
+        "the client acquires no closure whose transactions are not the sizes its endorser block declares, and disconnects the peer that served them"
         test_wrongSizedTxs
+    , testCase
+        "the client acquires the closure from a later delivery of a body whose write found more transactions held than the first's"
+        test_laterDeliveryHoldsMore
     , testCase
         "the client acquires the closure of an endorser block the node forged at a point whose body it already held, without acquiring the body again"
         test_forgedAfterBody
@@ -154,6 +166,9 @@ newContextGated point gate = do
   let MkLeiosPoint slot ebHash = point
   db <- newLeiosDBInMemory
   writer <- holdingBodies <$> openWriter db
+  txCache <- newPureLeiosTxCache defaultLeiosTxCacheShift
+  _ <-
+    insertAnnouncement txCache slot (MkRankingBlockHash (UnsafeHash (SBS.pack (replicate 32 1)))) ebHash
   outstanding <-
     uncheckedNewMVar $
       focusElectionIfUnfocused (ElectionId slot electee) ebHash $
@@ -169,6 +184,7 @@ newContextGated point gate = do
         { lfcStaticEnv = defaultLeiosFetchStaticEnv maxBound
         , lfcOutstanding = outstanding
         , lfcReady = ready
+        , lfcTxCache = txCache
         , lfcWriter = writer
         , lfcNotify = modifyTVar notes . (:) . note
         , lfcSystemTime = SystemTime (pure (RelativeTime 0)) (pure ())
@@ -213,8 +229,8 @@ closureRequest ctx point = do
             leiosFetchLogicIteration
               (lfcStaticEnv ctx)
               (\_slot -> Right maxBound)
-              (Just (SlotNo 6, 10))
-              (Map.singleton peer (Map.singleton point (MkPeerOffer SNothing OfferedClosure)))
+              (Just (SlotNo 6))
+              (Map.singleton peer (Map.singleton point (MkPeerOffer SNothing SNothing TxsClosureOffered)))
               Map.empty
               outstanding
       pure (outstanding', [r | LeiosBlockTxsRequest r <- foldMap toList decisions])
@@ -222,32 +238,24 @@ closureRequest ctx point = do
     [req] -> pure req
     _ -> assertFailure $ "expected one request, got " <> show (length reqs)
 
--- | An endorser block that misstates the sizes of its first two transactions,
--- by amounts that cancel out, so that their job's count, total size and hashes
--- all check out. Its third transaction is too big to share their job. The
--- LeiosDB drops the first two, so the client acquires no closure, fetches no
--- more of it, not even the third's job, and its settlement throws, through its
--- link to the client's thread.
+-- | An endorser block that misstates the sizes of its two transactions, by
+-- amounts that cancel out, so that their job's count, total size and hashes
+-- all check out. The LeiosDB drops both, so the client acquires no closure, and
+-- its settlement throws, through its link to the client's thread.
 test_wrongSizedTxs :: Assertion
 test_wrongSizedTxs = do
   let tx0 = MkLeiosTx (BS8.pack "tx zero")
       tx1 = MkLeiosTx (BS8.pack "tx one")
-      tx2 = MkLeiosTx (BS8.replicate (64 * 1024) 'x')
-      eb = mkEndorserBlock [(hashLeiosTx tx0, 6), (hashLeiosTx tx1, 7), (hashLeiosTx tx2, 64 * 1024)]
+      eb = mkEndorserBlock [(hashLeiosTx tx0, 6), (hashLeiosTx tx1, 7)]
       point = MkLeiosPoint (SlotNo 5) (endorserBlockHash eb)
       expected = ExnLeiosBlockTxsWrongSize point [0, 1]
   (ctx, notes) <- newContextAt point (pure ())
   processLeiosBlock ctx peer (MkLeiosBlockRequest point (encodeEndorserBlockSize eb) maxBound) eb
   awaitNotes notes 1 >>= (@?= [AcquiredBody point])
-  MkLeiosBlockTxsRequest _point jobs <- closureRequest ctx point
-  NEIntMap.size jobs @?= 2
+  req <- closureRequest ctx point
   result <-
     try $ do
-      processLeiosBlockTxs
-        ctx
-        peer
-        (MkLeiosBlockTxsRequest point (uncurry NEIntMap.singleton (NEIntMap.findMin jobs)))
-        (V.fromList [tx0, tx1])
+      processLeiosBlockTxs ctx peer req (V.fromList [tx0, tx1])
       -- Until the settlement's exception interrupts this.
       threadDelay 2000000
   case result of
@@ -256,7 +264,6 @@ test_wrongSizedTxs = do
       | otherwise -> assertFailure $ "unexpected exception: " <> show exn
     Right () -> assertFailure "the client settled the transactions without disconnecting the peer"
   readTVarIO notes >>= (@?= [AcquiredBody point])
-  readMVar (lfcOutstanding ctx) >>= assertNoJobLeft point
 
 test_wrongHash :: Assertion
 test_wrongHash = do
@@ -318,6 +325,41 @@ test_prunedWhileWriting = do
   outstanding <- readMVar (lfcOutstanding ctx)
   assertNoBody newer outstanding
 
+-- | Two peers deliver the 'fixture''s body before either write settles. An
+-- older point holds the first of its transactions when the first write lands,
+-- which copies it, and the other too by the time the second write lands, which
+-- copies both. The first write settles first.
+test_laterDeliveryHoldsMore :: Assertion
+test_laterDeliveryHoldsMore = do
+  let (point, eb, txs) = fixture
+      older = MkLeiosPoint (SlotNo 3) (pointEbHash point)
+      (heldFirst, heldLater) = splitAt 1 (zip [0 ..] txs)
+      req = MkLeiosBlockRequest point (encodeEndorserBlockSize eb) maxBound
+  settleFirst <- newEmptyTMVarIO
+  settleSecond <- newEmptyTMVarIO
+  gates <- newTQueueIO
+  atomically $
+    mapM_
+      (writeTQueue gates)
+      [pure (), atomically (readTMVar settleFirst), atomically (readTMVar settleSecond)]
+  (ctx, notes) <- newContextGated point (atomically (readTQueue gates))
+  let holdAtOlder held = do
+        dropped <- await =<< writeTxs (lfcWriter ctx) older [(off, leiosTxBytes tx) | (off, tx) <- held]
+        dropped @?= []
+        setTxLocations (lfcTxCache ctx) older [(off, hashLeiosTx tx) | (off, tx) <- held]
+  _ <- insertBody (lfcTxCache ctx) (pointEbHash point) (packEndorserBlock eb) () (\w _ _ _ _ -> w)
+  _ <- await =<< writeEbBody (lfcWriter ctx) older eb []
+  holdAtOlder heldFirst
+  processLeiosBlock ctx peer req eb
+  holdAtOlder heldLater
+  processLeiosBlock ctx otherPeer req eb
+  atomically $ putTMVar settleFirst ()
+  awaitNotes notes 1 >>= (@?= [AcquiredBody point])
+  atomically $ putTMVar settleSecond ()
+  awaitNotes notes 2 >>= (@?= [AcquiredBody point, AcquiredClosure point])
+ where
+  otherPeer = peer + 1
+
 -- | A peer delivers the 'fixture''s body, and then the node's own forge
 -- produces the same endorser block at the same point, while the closure is
 -- still to fetch.
@@ -328,7 +370,7 @@ test_forgedAfterBody = do
   processLeiosBlock ctx peer (MkLeiosBlockRequest point (encodeEndorserBlockSize eb) maxBound) eb
   awaitNotes notes 1 >>= (@?= [AcquiredBody point])
   modifyMVar_ (lfcOutstanding ctx) (pure . markReceivingFromForge point)
-  acquireForgedEb ctx point (forgeLeiosEb (fmap leiosTxBytes fixtureTxs))
+  acquireForgedEb ctx point (forgeLeiosEb EvenProtVer (fmap leiosTxBytes fixtureTxs))
   awaitNotes notes 2 >>= (@?= [AcquiredBody point, AcquiredClosure point])
   -- Long enough for any further emission to have landed.
   threadDelay 100000
@@ -339,12 +381,4 @@ assertNoBody point outstanding = case Map.lookup point (ebState outstanding) of
   Just (MkEbState _onset NoBody) -> pure ()
   Just (MkEbState _onset ReceivingFromForge{}) -> assertFailure "the point is being received from the forge"
   Just (MkEbState _onset BodyAcquired{}) -> assertFailure "the point holds a body"
-  Nothing -> assertFailure "the point has no entry"
-
-assertNoJobLeft :: LeiosPoint -> LeiosOutstanding peer -> Assertion
-assertNoJobLeft point outstanding = case Map.lookup point (ebState outstanding) of
-  Just (MkEbState _onset (BodyAcquired jobPool)) ->
-    assertBool "the point has jobs left" (nullLeiosJobPool jobPool)
-  Just (MkEbState _onset ReceivingFromForge{}) -> assertFailure "the point is being received from the forge"
-  Just (MkEbState _onset NoBody) -> assertFailure "the point holds no body"
   Nothing -> assertFailure "the point has no entry"

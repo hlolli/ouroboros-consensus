@@ -14,9 +14,13 @@ module Ouroboros.Consensus.MiniProtocol.LeiosFetch.Kernel
   , newLeiosFetchKernel
   , withLeiosFetchPeer
   , recordLeiosOffer
+  , recordLeiosCertOffer
+  , recordLeiosJumpOffers
+  , ExnLeiosTwoCertificationClaims (..)
   , onNewLeiosAnnouncement
   , onForgedLeiosEb
   , leiosFetchDecisionLoop
+  , leiosFetchFocuser
   , leiosFetchPruner
   ) where
 
@@ -32,41 +36,65 @@ import Data.Void (Void)
 import Data.Word (Word64)
 import Ouroboros.Consensus.Block
   ( BlockProtocol
+  , BlockSupportsProtocol (..)
+  , ConvertRawHash
+  , HasHeader
+  , Header
+  , Point (GenesisPoint)
   , Proxy (..)
   , SlotNo (..)
   , WithOrigin (..)
+  , blockPoint
+  , castPoint
+  , headerHash
+  , pointSlot
   , withOrigin
   )
 import Ouroboros.Consensus.BlockchainTime (BlockchainTime (..), CurrentSlot (..))
-import Ouroboros.Consensus.Config (TopLevelConfig, configLedger)
+import Ouroboros.Consensus.Config (TopLevelConfig, configBlock, configLedger)
 import Ouroboros.Consensus.Forecast (forecastFor)
-import Ouroboros.Consensus.HardFork.Abstract (HasHardForkHistory (..))
-import qualified Ouroboros.Consensus.HardFork.History as HardFork
+import Ouroboros.Consensus.HeaderStateHistory
+  ( HeaderStateHistory (..)
+  , HeaderStateWithTime (..)
+  )
+import Ouroboros.Consensus.HeaderValidation
+  ( AnnTip (..)
+  , HeaderState (..)
+  , HeaderWithTime (..)
+  , headerStatePoint
+  )
 import Ouroboros.Consensus.Ledger.Abstract (getTipSlot)
 import Ouroboros.Consensus.Ledger.Extended (ledgerState)
 import Ouroboros.Consensus.Ledger.SupportsProtocol (LedgerSupportsProtocol (..))
 import Ouroboros.Consensus.Leios.Protocol
   ( LeiosAnnouncement (..)
-  , LeiosLedgerView (..)
   , LeiosProtocol (..)
   , leiosEbBounds
   )
+import Ouroboros.Consensus.Leios.TxCache.API (LeiosTxCache (..))
 import Ouroboros.Consensus.Leios.Types
   ( ElectionId (..)
+  , EndorserBlockHash
   , ForgedEndorserBlock (..)
   , LeiosPoint (..)
   , endorserBlockHash
-  , minCertificationSlot
+  , toRankingBlockHash
   )
+import Ouroboros.Consensus.MiniProtocol.ChainSync.Client.State (JumpInfo (..))
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Client.Replies
   ( LeiosFetchClientContext (..)
+  , acquireCachedBody
   , acquireForgedEb
   )
 import Ouroboros.Consensus.MiniProtocol.LeiosFetch.Decision
-  ( LeiosEbBounds (..)
+  ( EbFetchState (..)
+  , EbState (..)
+  , LeiosEbBounds (..)
   , LeiosFetchRequest
   , LeiosOutstanding (..)
   , PeerOffer (..)
+  , WhetherTxsClosureOffered (..)
+  , focusCertifiedEb
   , focusElectionIfUnfocused
   , initializeLeiosOutstanding
   , leiosFetchLogicIteration
@@ -89,6 +117,7 @@ import Ouroboros.Consensus.Storage.LeiosDB.API
   )
 import Ouroboros.Consensus.Util.IOLike
   ( DiffTime
+  , Exception
   , IOLike
   , StrictMVar
   , StrictTVar
@@ -100,15 +129,19 @@ import Ouroboros.Consensus.Util.IOLike
   , modifyMVar_
   , modifyTVar
   , readTVar
+  , readTVarIO
   , retry
   , takeMVar
   , threadDelay
+  , throwIO
   , tryPutMVar
   , uncheckedNewEmptyMVar
   , uncheckedNewMVar
   , uncheckedNewTVarM
   , writeTVar
   )
+import qualified Ouroboros.Network.AnchoredFragment as AF
+import qualified Ouroboros.Network.AnchoredSeq as AS
 import Ouroboros.Network.PeerSelection.LedgerPeers.Type (IsBigLedgerPeer)
 import System.Random (StdGen)
 
@@ -123,8 +156,8 @@ data LeiosFetchKernel m peer blk = MkLeiosFetchKernel
   -- every earlier one.
   , lfkPrunedSlot :: !(StrictTVar m SlotNo)
   -- ^ The slot 'leiosFetchPruner' has most recently pruned the peers' offers
-  -- to. Nothing older is recorded afterwards, so that an offer that arrives
-  -- after the pruning cannot undo it.
+  -- and claims to. Nothing older is recorded afterwards, so that an offer or
+  -- claim that arrives after the pruning cannot undo it.
   }
 
 -- | Identifies one registration of an upstream peer with the decision loop,
@@ -150,11 +183,17 @@ data LeiosFetchPeer m blk = MkLeiosFetchPeer
   -- aggressively from a big-ledger peer.
   , lfpOfferings :: !(StrictTVar m (Map.Map LeiosPoint PeerOffer))
   -- ^ The peer's current offers, keyed by point. Written only by the
-  -- LeiosNotify client, as the peer offers, and by the decision loop and the
-  -- pruner, as offers go dead.
+  -- LeiosNotify and ChainSync clients, as the peer offers, and by the decision
+  -- loop and the pruner, as offers go dead.
   , lfpRequestsToSend :: !(StrictTVar m (Seq LeiosFetchRequest))
   -- ^ The requests the decision loop assigned to this peer that its LeiosFetch
   -- client has not sent yet.
+  , lfpCertificationClaims :: !(StrictTVar m (Map.Map ElectionId EndorserBlockHash))
+  -- ^ The endorser block the peer's ChainSync roll-forwards claim is certified,
+  -- per election; see 'recordLeiosCertOffer'.
+  , lfpJumpedThrough :: !(StrictTVar m (Point blk))
+  -- ^ The newest header of the latest ChainSync jump the peer accepted; see
+  -- 'recordLeiosJumpOffers'.
   }
 
 -- | The node's LeiosFetch state, seeded with the complete closures its LeiosDB
@@ -220,6 +259,8 @@ withLeiosFetchPeer kernel peer isBig k = bracket register unregister (uncurry k)
       MkLeiosFetchPeer isBig
         <$> uncheckedNewTVarM Map.empty
         <*> uncheckedNewTVarM Seq.empty
+        <*> uncheckedNewTVarM Map.empty
+        <*> uncheckedNewTVarM GenesisPoint
     atomically $ do
       peers <- readTVar lfkPeers
       -- 'LeiosPeerLifetimeId's order by their peer first, so this finds the
@@ -258,19 +299,169 @@ recordLeiosOffer kernel MkLeiosFetchPeer{lfpOfferings} point offer = do
       modifyTVar lfpOfferings (Map.insertWith (<>) point offer)
   void $ tryPutMVar (lfcReady (lfkContext kernel)) ()
 
+-- | Record the offer a peer makes by rolling forward a header that contains a
+-- Leios certificate: the endorser block the certificate certifies, both its
+-- body, at the size its announcement names, and its closure.
+--
+-- That endorser block is read from the state as of the header's predecessor,
+-- which announced it, so the peer chose which header to roll forward but not
+-- what its predecessor announced. The certificate has not been verified yet, so
+-- this only offers: what the node fetches is still up to each election's focus.
+recordLeiosCertOffer ::
+  forall m peer blk.
+  (IOLike m, BlockSupportsProtocol blk) =>
+  TopLevelConfig blk ->
+  LeiosFetchKernel m peer blk ->
+  LeiosFetchPeer m blk ->
+  Header blk ->
+  -- | The state as of the header's predecessor
+  HeaderStateWithTime blk ->
+  m ()
+recordLeiosCertOffer cfg kernel peerVars hdr predState =
+  when (getContainsLeiosCert p (validateView (configBlock cfg) hdr)) $
+    -- The predecessor of a valid header that contains a certificate announced
+    -- an endorser block, in an era with Leios, so the other cases cannot arise.
+    -- Ignoring the header then would be harmless.
+    case ( headerStateTip predHeaderState
+         , getCertifiableLeiosAnnouncement p (headerStateChainDep predHeaderState)
+         , hswtLeiosLedgerView predState
+         ) of
+      (NotOrigin predTip, Just announcement, SJust llv) -> do
+        let slot = annTipSlotNo predTip
+            ebHash = announcementEbHash announcement
+        noteCertificationClaim
+          kernel
+          peerVars
+          (ElectionId slot (announcementElectee announcement))
+          ebHash
+        recordLeiosOffer kernel peerVars (MkLeiosPoint slot ebHash) $
+          MkPeerOffer
+            { poEbBounds = SJust (leiosEbBounds llv)
+            , poOfferedBody = SJust (announcementEbSize announcement)
+            , poClosure = TxsClosureOffered
+            }
+      _ -> pure ()
+ where
+  p = Proxy @(BlockProtocol blk)
+  predHeaderState = hswtHeaderState predState
+
+-- | Count the peer's claim that an endorser block is certified for an
+-- election, disconnecting it if it contradicts an earlier claim of the peer's.
+--
+-- An honest peer rolls forward only what it selects, and one chain certifies at
+-- most one endorser block per election. Two chains certifying different ones
+-- take two valid certificates for one election, which only a committee that
+-- equivocated can produce.
+--
+-- Without this, a pool could equivocate its won slots into arbitrarily many
+-- announcing blocks, follow each with a header claiming a certificate --- the
+-- certificate is in the block body, which the node need never fetch --- and roll
+-- them all forward, growing the peer's offers without bound.
+--
+-- A claim for an election older than what has been pruned is not counted.
+noteCertificationClaim ::
+  IOLike m =>
+  LeiosFetchKernel m peer blk -> LeiosFetchPeer m blk -> ElectionId -> EndorserBlockHash -> m ()
+noteCertificationClaim kernel MkLeiosFetchPeer{lfpCertificationClaims} elId ebHash = do
+  conflict <- atomically $ do
+    prunedSlot <- readTVar (lfkPrunedSlot kernel)
+    claims <- readTVar lfpCertificationClaims
+    if electionSlot elId < prunedSlot
+      then pure Nothing
+      else case Map.lookup elId claims of
+        Nothing -> Nothing <$ writeTVar lfpCertificationClaims (Map.insert elId ebHash claims)
+        Just claimed -> pure $ if claimed == ebHash then Nothing else Just claimed
+  forM_ conflict $ \claimed -> throwIO $ ExnLeiosTwoCertificationClaims elId claimed ebHash
+
+-- | Thrown when a peer's ChainSync roll-forwards claim that two different
+-- endorser blocks are certified for one election; see 'noteCertificationClaim'.
+data ExnLeiosTwoCertificationClaims
+  = ExnLeiosTwoCertificationClaims !ElectionId !EndorserBlockHash !EndorserBlockHash
+  deriving Show
+
+instance Exception ExnLeiosTwoCertificationClaims
+
+-- | 'recordLeiosCertOffer' for each header of a ChainSync jump the peer
+-- accepted that its earlier jumps did not already cover.
+--
+-- Successive jumps along one chain overlap in all but their newest headers. If
+-- this jump's fragment holds the newest header of the previous jump, it holds
+-- the same headers before that one too, so those are skipped.
+recordLeiosJumpOffers ::
+  (IOLike m, LedgerSupportsProtocol blk) =>
+  TopLevelConfig blk ->
+  LeiosFetchKernel m peer blk ->
+  LeiosFetchPeer m blk ->
+  JumpInfo blk ->
+  m ()
+recordLeiosJumpOffers cfg kernel peerVars jumpInfo = do
+  jumpedThrough <- readTVarIO (lfpJumpedThrough peerVars)
+  forM_ (headersWithPredecessorStates jumpedThrough jumpInfo) $
+    uncurry (recordLeiosCertOffer cfg kernel peerVars)
+  atomically $
+    writeTVar (lfpJumpedThrough peerVars) (castPoint (AF.headPoint (jTheirFragment jumpInfo)))
+
+-- | The headers of the jump's fragment after the given point, each with the
+-- state as of its predecessor.
+--
+-- The history holds the state after each header of the fragment and after its
+-- anchor, so splitting both after the same point leaves the history's anchor
+-- holding the state before the first remaining header. If neither holds that
+-- point, all of the fragment is walked.
+headersWithPredecessorStates ::
+  forall blk.
+  LedgerSupportsProtocol blk =>
+  Point blk ->
+  JumpInfo blk ->
+  [(Header blk, HeaderStateWithTime blk)]
+headersWithPredecessorStates jumpedThrough jumpInfo =
+  zip
+    (hwtHeader <$> AF.toOldestFirst fragment)
+    (AS.anchor history : AS.toOldestFirst history)
+ where
+  past ::
+    AS.Anchorable (WithOrigin SlotNo) a b =>
+    (Either a b -> Point blk) ->
+    AS.AnchoredSeq (WithOrigin SlotNo) a b ->
+    AS.AnchoredSeq (WithOrigin SlotNo) a b
+  past pointOf s =
+    maybe s snd $
+      AS.splitAfterMeasure (pointSlot jumpedThrough) ((== jumpedThrough) . pointOf) s
+
+  fragment =
+    past (either (castPoint . AF.anchorToPoint) (castPoint . blockPoint)) $
+      jTheirFragment jumpInfo
+  history =
+    past (headerStatePoint . hswtHeaderState . either id id) $
+      unHeaderStateHistory $
+        jTheirHeaderStateHistory jumpInfo
+
 -- | List the endorser block a new announcement names as one to fetch, if it
--- takes its election's focus.
+-- takes its election's focus, and register the announcement with the
+-- LeiosTxCache.
 --
 -- One entry per election: the announcement that takes the election's focus. A
 -- second announcement for an already-focused election is an equivocation, and
 -- tracking its endorser block too would let a pool double what its won slots
--- cost us.
+-- cost us. If that one turns out to be the certified one, a verified
+-- certificate gives it an entry then.
+--
+-- If the announcement takes the focus and the LeiosTxCache holds its endorser
+-- block's body, taken in for another point, this acquires it at this point
+-- from there ('acquireCachedBody'), rather than fetching it again.
 onNewLeiosAnnouncement ::
-  IOLike m =>
+  forall m peer blk.
+  (IOLike m, ConvertRawHash blk, HasHeader (Header blk)) =>
   LeiosFetchKernel m peer blk ->
   ValidAnnouncement blk ->
   m ()
 onNewLeiosAnnouncement kernel valid = do
+  void $
+    insertAnnouncement
+      lfcTxCache
+      slot
+      (toRankingBlockHash (Proxy @blk) (headerHash (ancHeader anc)))
+      ebHash
   changed <- modifyMVar lfcOutstanding $ \outstanding ->
     let tooOld = slot < outstandingPrunedSlot outstanding
         introducesFocus = not $ Map.member elId (elFocus outstanding)
@@ -281,12 +472,12 @@ onNewLeiosAnnouncement kernel valid = do
           if tooOld || not introducesFocus
             then (outstanding, False)
             else (outstanding', True)
-  when changed $
-    void $
-      tryPutMVar lfcReady ()
+  when changed $ do
+    acquireCachedBody (lfkContext kernel) point announcementEbBounds
+    void $ tryPutMVar lfcReady ()
  where
-  MkLeiosFetchClientContext{lfcOutstanding, lfcReady} = lfkContext kernel
-  MkValidAnnouncement{announcingHeader = anc, announcementOnset} = valid
+  MkLeiosFetchClientContext{lfcOutstanding, lfcReady, lfcTxCache} = lfkContext kernel
+  MkValidAnnouncement{announcingHeader = anc, announcementOnset, announcementEbBounds} = valid
   announcement = ancAnnouncement anc
   elId = ancElectionId anc
   slot = electionSlot elId
@@ -304,12 +495,19 @@ onNewLeiosAnnouncement kernel valid = do
 --
 -- The header must announce this endorser block.
 onForgedLeiosEb ::
-  IOLike m =>
+  forall m peer blk.
+  (IOLike m, ConvertRawHash blk, HasHeader (Header blk)) =>
   LeiosFetchKernel m peer blk ->
   AnnouncingHeader blk ->
   ForgedEndorserBlock ->
   m ()
 onForgedLeiosEb kernel anc forged = do
+  void $
+    insertAnnouncement
+      lfcTxCache
+      slot
+      (toRankingBlockHash (Proxy @blk) (headerHash (ancHeader anc)))
+      ebHash
   modifyMVar_ lfcOutstanding $ \outstanding ->
     pure $
       if slot < outstandingPrunedSlot outstanding
@@ -317,7 +515,7 @@ onForgedLeiosEb kernel anc forged = do
         else focusElectionIfUnfocused elId ebHash $ markReceivingFromForge point outstanding
   acquireForgedEb (lfkContext kernel) point forged
  where
-  MkLeiosFetchClientContext{lfcOutstanding} = lfkContext kernel
+  MkLeiosFetchClientContext{lfcOutstanding, lfcTxCache} = lfkContext kernel
   elId = ancElectionId anc
   slot = electionSlot elId
   ebHash = endorserBlockHash (forgedEbBody forged)
@@ -327,7 +525,7 @@ onForgedLeiosEb kernel anc forged = do
 -- request from every peer, at most twice a second.
 leiosFetchDecisionLoop ::
   forall m peer blk.
-  (IOLike m, Ord peer, LedgerSupportsProtocol blk, HasHardForkHistory blk) =>
+  (IOLike m, Ord peer, LedgerSupportsProtocol blk) =>
   TopLevelConfig blk ->
   ChainDB m blk ->
   BlockchainTime m ->
@@ -345,39 +543,24 @@ leiosFetchDecisionLoop cfg chainDB btime kernel = forever $ do
       peersVars <- readTVar lfkPeers
       offerings <- traverse (readTVar . lfpOfferings) peersVars
       (,,,) peersVars offerings <$> getCurrentSlot btime <*> ChainDB.getImmutableLedger chainDB
-    let
-      -- One forecast anchor for the whole pass: the immutable tip, which is
-      -- also what the announcement validation a LeiosNotify offer rides on
-      -- forecast from, so it reaches every slot such an offer names.
-      forecastLeiosView slot =
-        getLeiosLedgerView (Proxy @(BlockProtocol blk))
-          <$> runExcept
-            (forecastFor (ledgerViewForecastAt (configLedger cfg) (ledgerState immLedger)) slot)
-      forecastEbBounds slot = maybe (MkLeiosEbBounds 0 0) leiosEbBounds <$> forecastLeiosView slot
-      -- The current slot, and how many slots before it a point is still worth
-      -- voting on, by the Leios periods of the ledger there, if the ledger
-      -- reaches that far.
-      mbHorizon = case currentSlot of
-        CurrentSlotUnknown -> Nothing
-        CurrentSlot slot -> do
-          llv <- either (const Nothing) id (forecastLeiosView slot)
-          (_onset, slotLength) <-
-            either (const Nothing) Just $
-              HardFork.runQuery
-                (HardFork.slotToWallclock slot)
-                (hardForkSummary (configLedger cfg) (ledgerState immLedger))
-          let MkLeiosLedgerView{llvAnnouncementPeriod, llvVotePeriod, llvDiffusionPeriod} = llv
-              SlotNo window =
-                minCertificationSlot slotLength llvAnnouncementPeriod llvVotePeriod llvDiffusionPeriod 0
-          pure (slot, window)
-      (!outstanding', requests, offerDrops) =
-        leiosFetchLogicIteration
-          (lfcStaticEnv lfkContext)
-          forecastEbBounds
-          mbHorizon
-          offerings
-          (Map.map lfpIsBigLedgerPeer peersVars)
-          outstanding
+    let mbCurrentSlot = case currentSlot of
+          CurrentSlot s -> Just s
+          CurrentSlotUnknown -> Nothing
+        -- One forecast anchor for the whole pass: the immutable tip, which is
+        -- also what the announcement validation a LeiosNotify offer rides on
+        -- forecast from, so it reaches every slot such an offer names.
+        forecastEbBounds slot =
+          maybe (MkLeiosEbBounds 0 0) leiosEbBounds . getLeiosLedgerView (Proxy @(BlockProtocol blk))
+            <$> runExcept
+              (forecastFor (ledgerViewForecastAt (configLedger cfg) (ledgerState immLedger)) slot)
+        (!outstanding', requests, offerDrops) =
+          leiosFetchLogicIteration
+            (lfcStaticEnv lfkContext)
+            forecastEbBounds
+            mbCurrentSlot
+            offerings
+            (Map.map lfpIsBigLedgerPeer peersVars)
+            outstanding
     pure (outstanding', (requests, offerDrops, peersVars))
   atomically $ do
     -- Prune what of the offers the decision found can no longer help.
@@ -402,8 +585,60 @@ leiosFetchDecisionLoop cfg chainDB btime kernel = forever $ do
   loopInterval :: DiffTime
   loopInterval = 0.5
 
--- | Prune the node's LeiosFetch state and the peers' offers each time the
--- immutable tip's slot advances.
+-- | Move each election's focus onto the endorser block a verified certificate
+-- certifies, as ChainSel verifies such certificates.
+--
+-- This is how a node that only saw some other announcement for the election,
+-- or none, because the announcing block has been on its selection since before
+-- it started, comes to fetch the certified one. Each iteration compares the
+-- certified endorser blocks against the ones it last saw, so a certificate
+-- verified after the offer arrived still moves the focus.
+--
+-- If that moves an election's focus onto an endorser block whose body the
+-- LeiosTxCache holds, taken in for another point, this acquires it at the
+-- certified point from there ('acquireCachedBody'), rather than fetching it
+-- again.
+leiosFetchFocuser ::
+  IOLike m =>
+  ChainDB m blk ->
+  LeiosFetchKernel m peer blk ->
+  m Void
+leiosFetchFocuser chainDB kernel = go Map.empty
+ where
+  MkLeiosFetchClientContext{lfcOutstanding, lfcReady} = lfkContext kernel
+
+  go seen = do
+    certified <- atomically $ do
+      certified <- ChainDB.getLeiosCertifiedEbs chainDB
+      if certified == seen then retry else pure certified
+    let arrived =
+          Map.differenceWith (\new old -> if new == old then Nothing else Just new) certified seen
+    missing <- modifyMVar lfcOutstanding $ \outstanding ->
+      pure $ Map.foldlWithKey' focus (outstanding, []) arrived
+    -- The committee voted for each at its point, so the ledger's bounds there
+    -- admit it.
+    forM_ missing $ \point -> acquireCachedBody (lfkContext kernel) point maxBound
+    void $ tryPutMVar lfcReady ()
+    go certified
+
+  focus (outstanding, missing) elId ebHash =
+    let outstanding' = focusCertifiedEb elId ebHash outstanding
+        point = MkLeiosPoint (electionSlot elId) ebHash
+     in ( outstanding'
+        , case ebState outstanding' Map.!? point of
+            Just (MkEbState _onset NoBody) -> point : missing
+            _ -> missing
+        )
+
+-- | Prune the node's LeiosFetch state, the peers' offers and claims, and the
+-- LeiosTxCache each time the immutable tip's slot advances.
+--
+-- The LeiosTxCache must be pruned to a slot strictly before the LeiosDB is;
+-- see 'evictOlderThan'. The ChainDB prunes the LeiosDB only to the slot of the
+-- blocks it has copied to the ImmutableDB, after a delay, so pruning the cache
+-- as soon as the immutable tip advances comes first.
+--
+-- TODO Make that ordering structural rather than a matter of timing.
 leiosFetchPruner ::
   forall m peer blk.
   (IOLike m, LedgerSupportsProtocol blk) =>
@@ -413,7 +648,7 @@ leiosFetchPruner ::
 leiosFetchPruner chainDB kernel = go (SlotNo 0)
  where
   MkLeiosFetchKernel{lfkContext, lfkPeers, lfkPrunedSlot} = kernel
-  MkLeiosFetchClientContext{lfcOutstanding} = lfkContext
+  MkLeiosFetchClientContext{lfcOutstanding, lfcTxCache} = lfkContext
 
   go prunedSlot = do
     immTipSlot <- atomically $ do
@@ -421,11 +656,16 @@ leiosFetchPruner chainDB kernel = go (SlotNo 0)
       case getTipSlot (ledgerState immLedger) of
         NotOrigin slot | prunedSlot < slot -> pure slot
         _ -> retry
+    _ <- evictOlderThan lfcTxCache immTipSlot
     modifyMVar_ lfcOutstanding $ pure . snd . pruneOutstandingToImmTip immTipSlot
-    -- Offers are keyed by point, which orders by slot first.
+    -- Offers are keyed by point and claims by election, which both order by
+    -- slot first.
     atomically $ do
       writeTVar lfkPrunedSlot immTipSlot
       peersVars <- readTVar lfkPeers
-      forM_ peersVars $ \vars ->
+      forM_ peersVars $ \vars -> do
         modifyTVar (lfpOfferings vars) (Map.dropWhileAntitone ((< immTipSlot) . pointSlotNo))
+        modifyTVar
+          (lfpCertificationClaims vars)
+          (Map.dropWhileAntitone ((< immTipSlot) . electionSlot))
     go immTipSlot
